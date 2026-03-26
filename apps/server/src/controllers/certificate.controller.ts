@@ -64,7 +64,7 @@ export const verifyCertificate = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const result = await certificateService.verifyCertificate(req.params.certNo);
+    const result = await certificateService.verifyCertificate(String(req.params.certNo));
     res.json({ code: 0, data: result });
   } catch (error) {
     next(error);

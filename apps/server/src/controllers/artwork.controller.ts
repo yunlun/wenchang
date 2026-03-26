@@ -51,7 +51,7 @@ export const getArtwork = async (
 ): Promise<void> => {
   try {
     const artwork = await artworkService.getArtworkById(
-      req.params.id,
+      String(req.params.id),
       req.user!.id
     );
     if (!artwork) throw new AppError('作品不存在', 404);

@@ -90,6 +90,22 @@ export class ArtworkService {
         },
       });
 
+      // ── Step 3b: 轮询等待链上确认 ────────────────────
+      logger.info(`[Artwork] Waiting for on-chain confirmation: ${chainResult.txHash}`);
+      await ArtworkModel.findByIdAndUpdate(artworkId, { status: 'submitting' });
+
+      const confirmation = await wenchangService.waitForConfirmation(chainResult.txHash);
+
+      if (!confirmation.confirmed) {
+        // 广播出去了但链上没确认（余额不足、格式错误等）
+        await ArtworkModel.findByIdAndUpdate(artworkId, {
+          status: 'failed',
+          blockchainTxHash: chainResult.txHash,
+          errorMessage: '交易已广播但链上未确认，可能原因：账户余额不足（ugas）或交易格式错误',
+        });
+        return;
+      }
+
       await ArtworkModel.findByIdAndUpdate(artworkId, {
         blockchainTxHash: chainResult.txHash,
         status: 'confirmed',

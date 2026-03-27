@@ -7,47 +7,43 @@ import type {
 import { logger } from '../config/logger';
 
 /**
- * 文昌链 / BSN 网关 API 服务
- * 说明：不同 BSN 网关版本在「鉴权头」和「接口路径」上存在差异，
- * 这里做了多组兼容尝试，优先走环境变量显式配置。
+ * 文昌链 / BSN 开放联盟链网关 API 服务
+ *
+ * 接入说明（来自 BSN 文档 7.3.1）：
+ * REST 接口地址格式：
+ *   {网关}/api/{projectId}/{bsnAccount}/rest/txs      ← 托管签名广播
+ *   {网关}/api/{projectId}/{bsnAccount}/rest/{irita接口路径}
+ * Header 中需带：x-api-key: {projectKey}
+ *
+ * 本服务采用「存 Memo 哈希」策略：
+ * 把作品 SHA-256 写入一笔链上交易的 memo 字段，
+ * 不依赖 WASM 合约，任何开放联盟链项目即可使用。
  */
 export class WenchangService {
   private client: AxiosInstance;
-  private baseURL: string;
   private projectId: string;
   private projectKey: string;
+  private bsnAccount: string;
   private chainId: string;
-  private gasPrice: string;
+  private fromAddress: string;
 
   constructor() {
-    this.baseURL =
-      process.env.WENCHANG_API_URL || 'https://opbningxia.bsngate.com:18602';
-
-    this.projectId =
-      process.env.BSN_PROJECT_ID ||
-      process.env.WENCHANG_PROJECT_ID ||
-      '';
-
-    this.projectKey =
-      process.env.BSN_PROJECT_KEY ||
-      process.env.WENCHANG_API_KEY ||
-      '';
-
+    const baseURL = process.env.WENCHANG_API_URL || 'https://opbningxia.bsngate.com:18602';
+    this.projectId = process.env.BSN_PROJECT_ID || process.env.WENCHANG_PROJECT_ID || '';
+    this.projectKey = process.env.BSN_PROJECT_KEY || process.env.WENCHANG_API_KEY || '';
+    this.bsnAccount = process.env.WENCHANG_BSN_ACCOUNT || '';
     this.chainId = process.env.WENCHANG_CHAIN_ID || 'wenchangchain';
-    this.gasPrice = process.env.WENCHANG_GAS_PRICE || '1.0';
+    this.fromAddress = process.env.WENCHANG_FROM_ADDRESS || '';
 
-    if (!this.projectId) {
-      throw new Error('请配置 BSN_PROJECT_ID（或 WENCHANG_PROJECT_ID）');
-    }
-    if (!this.projectKey) {
-      throw new Error('请配置 BSN_PROJECT_KEY（或 WENCHANG_API_KEY）');
-    }
+    if (!this.projectId) throw new Error('请在 .env 中配置 BSN_PROJECT_ID');
+    if (!this.projectKey) throw new Error('请在 .env 中配置 BSN_PROJECT_KEY');
 
     this.client = axios.create({
-      baseURL: this.baseURL,
+      baseURL,
       timeout: 30_000,
       headers: {
         'Content-Type': 'application/json',
+        'x-api-key': this.projectKey,
       },
     });
 
@@ -57,169 +53,217 @@ export class WenchangService {
     });
   }
 
-  private submitPathCandidates(): string[] {
+  /**
+   * 构造 REST 接口路径候选列表
+   * 优先用 WENCHANG_SUBMIT_PATH 精确指定，否则自动枚举
+   */
+  private restPaths(suffix: string): string[] {
     const custom = process.env.WENCHANG_SUBMIT_PATH;
-    const defaults = [
-      '/v1beta1/nft/nfts',
-      '/api/v1beta1/nft/nfts',
-      '/api/v1/nft/nfts',
+    if (custom) return [custom];
+
+    const bases: string[] = [
+      ...(this.bsnAccount
+        ? [`/api/${this.projectId}/${this.bsnAccount}/rest`]
+        : []),
+      `/api/${this.projectId}/rest`,
     ];
-    return custom ? [custom, ...defaults.filter((p) => p !== custom)] : defaults;
-  }
 
-  private queryPathCandidates(): string[] {
-    const custom = process.env.WENCHANG_QUERY_PATH;
-    const defaults = ['/v1beta1/tx', '/api/v1beta1/tx', '/api/v1/tx'];
-    return custom ? [custom, ...defaults.filter((p) => p !== custom)] : defaults;
-  }
-
-  private authHeaderCandidates(): Record<string, string>[] {
-    return [
-      {
-        'X-Project-Id': this.projectId,
-        'X-Api-Key': this.projectKey,
-      },
-      {
-        projectId: this.projectId,
-        projectKey: this.projectKey,
-      },
-      {
-        appId: this.projectId,
-        appKey: this.projectKey,
-      },
-    ];
-  }
-
-  private buildBodyCandidates(payload: WenchangSubmitRequest): Record<string, unknown>[] {
-    const nftBody = {
-      class_id: process.env.WENCHANG_CLASS_ID || 'copyright',
-      name: payload.metadata.title,
-      uri: '',
-      uri_hash: payload.hash,
-      data: JSON.stringify(payload.metadata),
-      recipient: process.env.WENCHANG_RECIPIENT_ADDR || '',
-    };
-
-    return [
-      // 版本1：直接 NFT body
-      nftBody,
-      // 版本2：带链参数包裹
-      {
-        chain_id: this.chainId,
-        gas_price: this.gasPrice,
-        data: nftBody,
-      },
-      // 版本3：另一种命名
-      {
-        chainId: this.chainId,
-        gasPrice: this.gasPrice,
-        body: nftBody,
-      },
-    ];
-  }
-
-  private normalizeSubmitResponse(data: Record<string, unknown>): WenchangSubmitResponse {
-    const txHash =
-      (data.tx_hash as string) ||
-      (data.txHash as string) ||
-      (data.hash as string) ||
-      (data.result as { txHash?: string } | undefined)?.txHash ||
-      '';
-
-    if (!txHash) {
-      throw new Error(`网关返回成功但未找到 txHash: ${JSON.stringify(data)}`);
-    }
-
-    return {
-      success: true,
-      txHash,
-      blockHeight:
-        (data.height as number | undefined) ||
-        (data.block_height as number | undefined) ||
-        (data.blockHeight as number | undefined),
-      fee: (data.gas_fee as string | undefined) || (data.fee as string | undefined),
-      timestamp: (data.timestamp as string | undefined) || new Date().toISOString(),
-    };
+    return bases.map((b) => `${b}/${suffix}`);
   }
 
   /**
-   * 提交作品哈希上链存证
+   * 提交作品哈希上链
+   *
+   * 策略：用 irita「bank/send」接口（zero-value 转账），
+   * 把 SHA-256 哈希写入 memo 字段，完成链上存证。
+   * 这是 BSN 文档中无需合约的最小可行方案。
    */
   async submitHash(payload: WenchangSubmitRequest): Promise<WenchangSubmitResponse> {
+    const memo = `WC:${payload.hash}|${payload.metadata.title}|${payload.metadata.author}`;
+    const from = this.fromAddress;
+    const denom = process.env.WENCHANG_FEE_DENOM || 'ugas';
+    const gas = process.env.WENCHANG_GAS || '80000';
+    const feeAmount = process.env.WENCHANG_FEE_AMOUNT || '800';
+
+    // BSN 托管签名广播报文（v1 格式）
+    const txBody = {
+      tx: {
+        msg: [
+          {
+            type: 'cosmos-sdk/MsgSend',
+            value: {
+              from_address: from,
+              to_address: from,          // 零值自发，只是为了把 memo 写链上
+              amount: [{ amount: '1', denom }],
+            },
+          },
+        ],
+        fee: {
+          amount: [{ amount: feeAmount, denom }],
+          gas,
+        },
+        signatures: null,
+        memo,
+      },
+      mode: 'sync',
+    };
+
+    const paths = this.restPaths('txs');
     const errors: string[] = [];
-    const paths = this.submitPathCandidates();
-    const headersList = this.authHeaderCandidates();
-    const bodies = this.buildBodyCandidates(payload);
 
     for (const path of paths) {
-      for (const headers of headersList) {
-        for (const body of bodies) {
-          try {
-            const { data } = await this.client.post(path, body, {
-              headers: {
-                ...headers,
-                'X-Chain-Id': this.chainId,
-                'X-Gas-Price': this.gasPrice,
-              },
-            });
+      try {
+        logger.debug(`[Wenchang] trying path: ${path}`);
+        const { data } = await this.client.post(path, txBody);
 
-            return this.normalizeSubmitResponse((data || {}) as Record<string, unknown>);
-          } catch (error: unknown) {
-            const msg =
-              (error as { response?: { status?: number; data?: unknown }; message?: string })
-                .response?.status
-                ? `[${path}] status=${(error as { response?: { status?: number } }).response?.status} body=${JSON.stringify((error as { response?: { data?: unknown } }).response?.data || {})}`
-                : `[${path}] ${(error as { message?: string }).message || 'unknown error'}`;
-            errors.push(msg);
-          }
+        const raw = (data || {}) as Record<string, unknown>;
+        const txHash =
+          (raw.txhash as string) ||
+          (raw.tx_hash as string) ||
+          (raw.txHash as string) ||
+          (raw.hash as string) ||
+          ((raw.result as { txhash?: string } | undefined)?.txhash) ||
+          '';
+
+        // ── 关键：检查链上 code，非 0 表示交易被链拒绝 ──
+        const chainCode = raw.code as number | undefined;
+        if (chainCode !== undefined && chainCode !== 0) {
+          const rawLog = (raw.raw_log as string) || JSON.stringify(raw);
+          const msg = `交易被链拒绝 code=${chainCode}: ${rawLog}`;
+          logger.error(`[Wenchang] ${path} ${msg}`);
+          errors.push(`[${path}] chain_code=${chainCode} raw_log=${rawLog.slice(0, 200)}`);
+          continue; // 尝试下一条路径（通常无意义，但保持一致性）
+        }
+
+        if (!txHash) {
+          logger.warn(`[Wenchang] ${path} returned 2xx but no txHash: ${JSON.stringify(raw)}`);
+          errors.push(`[${path}] no_txhash: ${JSON.stringify(raw).slice(0, 200)}`);
+          continue;
+        }
+
+        logger.info(`[Wenchang] submitHash success txHash=${txHash}`);
+        return {
+          success: true,
+          txHash,
+          blockHeight:
+            (raw.height as number | undefined) ||
+            (raw.block_height as number | undefined),
+          fee: `${feeAmount}${denom}`,
+          timestamp: new Date().toISOString(),
+        };
+      } catch (error: unknown) {
+        const e = error as { response?: { status?: number; data?: unknown }; message?: string };
+        const status = e.response?.status ?? 0;
+        const body = JSON.stringify(e.response?.data || {}).slice(0, 300);
+        const msg = `[${path}] status=${status} body=${body}`;
+        errors.push(msg);
+        logger.warn(`[Wenchang] ${msg}`);
+
+        if (body.includes('Non-gRPC')) {
+          throw new Error(
+            '当前 BSN 网关端口是 gRPC 路由，无法用 HTTP/JSON 调用。' +
+            '请去 BSN 控制台查看「接入参数」里的 REST 接口地址（通常端口不同）。'
+          );
         }
       }
     }
 
-    const allErrors = errors.join(' | ');
-    logger.error('[Wenchang] submitHash failed all strategies:', allErrors);
-
-    if (allErrors.includes('Non-gRPC request matched gRPC route')) {
-      throw new Error(
-        '当前 BSN 网关是 gRPC 路由，不支持 axios 的 HTTP JSON 调用。请改用 gRPC 客户端，或向 BSN 控制台确认可用的 HTTP/OpenAPI 网关地址。'
-      );
-    }
-
+    const detail = errors.join(' \n');
+    logger.error('[Wenchang] submitHash failed all paths:', detail);
     throw new Error(
-      '文昌链存证提交失败，请检查 BSN 网关地址/项目ID/项目Key/接口路径。可在 WENCHANG_SUBMIT_PATH 指定准确路径。'
+      `文昌链存证提交失败。\n排查步骤：\n` +
+      `1. 确认 WENCHANG_BSN_ACCOUNT 已正确配置（BSN控制台->接入参数）\n` +
+      `2. 确认 WENCHANG_FROM_ADDRESS 已配置（链上账户地址）\n` +
+      `3. 或设置 WENCHANG_SUBMIT_PATH 为精确接口路径\n` +
+      `详细错误：\n${detail}`
     );
   }
 
   /**
-   * 查询链上存证记录
+   * 轮询确认交易是否真正上链（广播后链需要几秒出块）
+   * 最多等待 maxWaitMs，每隔 intervalMs 查一次
+   */
+  async waitForConfirmation(
+    txHash: string,
+    maxWaitMs = 60_000,
+    intervalMs = 3_000
+  ): Promise<{ confirmed: boolean; blockHeight?: number; timestamp?: string }> {
+    const deadline = Date.now() + maxWaitMs;
+    const queryPaths = process.env.WENCHANG_QUERY_PATH
+      ? [process.env.WENCHANG_QUERY_PATH]
+      : [
+          ...(this.bsnAccount
+            ? [`/api/${this.projectId}/${this.bsnAccount}/rest/txs/${txHash}`]
+            : []),
+          `/api/${this.projectId}/rest/txs/${txHash}`,
+        ];
+
+    while (Date.now() < deadline) {
+      for (const fullPath of queryPaths) {
+        try {
+          const { data } = await this.client.get(fullPath);
+          const raw = (data || {}) as Record<string, unknown>;
+          const code = raw.code as number | undefined;
+          const height = (raw.height as string | number | undefined);
+
+          // code 0 且有 height 表示真正上链
+          if ((code === undefined || code === 0) && height) {
+            logger.info(`[Wenchang] tx confirmed height=${height} txHash=${txHash}`);
+            return {
+              confirmed: true,
+              blockHeight: typeof height === 'string' ? parseInt(height) : height,
+              timestamp: raw.timestamp as string | undefined,
+            };
+          }
+          // code 非 0 表示链上执行失败，不必继续等待
+          if (code !== undefined && code !== 0) {
+            logger.error(`[Wenchang] tx failed on chain code=${code} raw_log=${raw.raw_log}`);
+            return { confirmed: false };
+          }
+        } catch {
+          // 查询失败（404 等）说明还未上链，继续等
+        }
+      }
+      logger.debug(`[Wenchang] waiting for tx confirmation... txHash=${txHash}`);
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+
+    logger.warn(`[Wenchang] tx confirmation timeout txHash=${txHash}`);
+    return { confirmed: false };
+  }
+
+  /**
+   * 查询链上存证记录（按 txHash 查询交易详情）
    */
   async queryByTxHash(txHash: string): Promise<WenchangQueryResponse> {
-    const paths = this.queryPathCandidates();
+    const queryPaths = process.env.WENCHANG_QUERY_PATH
+      ? [process.env.WENCHANG_QUERY_PATH]
+      : [
+          ...(this.bsnAccount
+            ? [`/api/${this.projectId}/${this.bsnAccount}/rest/txs/${txHash}`]
+            : []),
+          `/api/${this.projectId}/rest/txs/${txHash}`,
+          `/api/${this.projectId}/rpc/tx?hash=0x${txHash}&prove=false`,
+        ];
 
-    for (const basePath of paths) {
+    for (const fullPath of queryPaths) {
       try {
-        const { data } = await this.client.get(`${basePath}/${txHash}`, {
-          headers: {
-            'X-Project-Id': this.projectId,
-            'X-Api-Key': this.projectKey,
-            projectId: this.projectId,
-            projectKey: this.projectKey,
-          },
-        });
-
+        const { data } = await this.client.get(fullPath);
+        const raw = (data || {}) as Record<string, unknown>;
         return {
           found: true,
-          txHash: ((data as { tx_hash?: string; txHash?: string }).tx_hash ||
-            (data as { txHash?: string }).txHash ||
-            txHash) as string,
+          txHash:
+            (raw.txhash as string) ||
+            (raw.tx_hash as string) ||
+            txHash,
           blockHeight:
-            (data as { height?: number; block_height?: number }).height ||
-            (data as { block_height?: number }).block_height,
-          data: (data || {}) as Record<string, unknown>,
-          timestamp: (data as { timestamp?: string }).timestamp,
+            (raw.height as number | undefined) ||
+            (raw.block_height as number | undefined),
+          data: raw,
+          timestamp: (raw.timestamp as string | undefined),
         };
       } catch {
-        // try next path
+        // try next
       }
     }
 

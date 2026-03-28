@@ -78,36 +78,53 @@ export class ArtworkService {
       const user = await UserModel.findById(userId).lean();
       if (!user) return;
 
-      const chainResult = await wenchangService.submitHash({
-        hash: sha256Hash,
-        metadata: {
-          title: artwork.title,
-          author: user.name,
-          studio: user.studioName,
-          timestamp: Date.now(),
-          fileSize: artwork.fileSize,
-          mimeType: artwork.mimeType,
-        },
-      });
+      let chainResult;
+      try {
+        chainResult = await wenchangService.submitHash({
+          hash: sha256Hash,
+          metadata: {
+            title: artwork.title,
+            author: user.name,
+            studio: user.studioName,
+            timestamp: Date.now(),
+            fileSize: artwork.fileSize,
+            mimeType: artwork.mimeType,
+          },
+        });
+      } catch (chainError) {
+        const detail = chainError instanceof Error ? chainError.message : '未知错误';
+        logger.warn(`[Artwork] Wenchang submit failed, degrading to pending: ${detail}`);
+
+        const isInsufficientFunds = detail.includes('insufficient funds') || detail.includes('余额不足');
+        const reason = isInsufficientFunds
+          ? '链上账户余额不足（ugas），请先充值后重试。'
+          : `存证暂时失败：${detail.slice(0, 200)}`;
+
+        await ArtworkModel.findByIdAndUpdate(artworkId, {
+          status: 'pending',
+          errorMessage: reason,
+        });
+        return;
+      }
 
       // ── Step 3b: 轮询等待链上确认 ────────────────────
-      logger.info(`[Artwork] Waiting for on-chain confirmation: ${chainResult.txHash}`);
+      logger.info(`[Artwork] Waiting for on-chain confirmation: ${chainResult!.txHash}`);
       await ArtworkModel.findByIdAndUpdate(artworkId, { status: 'submitting' });
 
-      const confirmation = await wenchangService.waitForConfirmation(chainResult.txHash);
+      const confirmation = await wenchangService.waitForConfirmation(chainResult!.txHash);
 
       if (!confirmation.confirmed) {
         // 广播出去了但链上没确认（余额不足、格式错误等）
         await ArtworkModel.findByIdAndUpdate(artworkId, {
           status: 'failed',
-          blockchainTxHash: chainResult.txHash,
-          errorMessage: '交易已广播但链上未确认，可能原因：账户余额不足（ugas）或交易格式错误',
+          blockchainTxHash: chainResult!.txHash,
+          errorMessage: '链上未确认（非 code=0）。请在 BSN 网关查询该 txHash 的 code 与 raw_log。',
         });
         return;
       }
 
       await ArtworkModel.findByIdAndUpdate(artworkId, {
-        blockchainTxHash: chainResult.txHash,
+        blockchainTxHash: chainResult!.txHash,
         status: 'confirmed',
       });
 

@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
-import { Upload, FileCheck, Award, LogOut, Shield, Plus, Loader2, CheckCircle, Clock, XCircle, RefreshCw } from 'lucide-react';
+import { Upload, FileCheck, Award, LogOut, Shield, Plus, Loader2, CheckCircle, Clock, XCircle, RefreshCw, ExternalLink } from 'lucide-react';
 import { artworkApi, authApi, certificateApi } from '@/lib/api';
 import dayjs from 'dayjs';
 
@@ -17,6 +17,7 @@ interface Artwork {
   fileSize: number;
   createdAt: string;
   blockchainTxHash?: string;
+  errorMessage?: string;
 }
 
 interface User {
@@ -103,6 +104,21 @@ export default function DashboardPage() {
     }
   };
 
+  const handleQueryTx = async (artworkId: string) => {
+    try {
+      const res = await artworkApi.queryTx(artworkId);
+      const payload = JSON.stringify(res.data.data, null, 2);
+      const win = window.open('', '_blank');
+      if (win) {
+        win.document.write(`<pre style="white-space:pre-wrap;word-break:break-all;padding:16px;font-family:ui-monospace,Menlo,monospace;">${payload.replace(/</g, '&lt;')}</pre>`);
+        win.document.title = '链上交易查询结果';
+      }
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { message?: string } } }).response?.data?.message || '查询交易失败';
+      alert(msg);
+    }
+  };
+
   const logout = () => {
     localStorage.removeItem('wc_token');
     router.push('/');
@@ -186,17 +202,43 @@ export default function DashboardPage() {
             ) : (
               artworks.map((a) => {
                 const s = STATUS_MAP[a.status];
+
                 return (
-                  <div key={a._id} className="flex items-center justify-between rounded-xl border border-border bg-card px-5 py-4 transition-shadow hover:shadow-md">
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate font-medium">{a.title}</p>
-                      <p className="mt-0.5 font-mono text-xs text-muted-foreground truncate">
-                        {a.sha256Hash !== 'pending' ? a.sha256Hash : '—'}
-                      </p>
-                      <p className="mt-1 text-xs text-muted-foreground">{dayjs(a.createdAt).format('YYYY-MM-DD HH:mm')}</p>
-                    </div>
-                    <div className={`ml-4 flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${s.color}`}>
-                      {s.icon} {s.label}
+                  <div key={a._id} className="rounded-xl border border-border bg-card px-5 py-4 transition-shadow hover:shadow-md">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate font-medium">{a.title}</p>
+                        <p className="mt-0.5 font-mono text-xs text-muted-foreground truncate">
+                          {a.sha256Hash !== 'pending' ? a.sha256Hash : '—'}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">{dayjs(a.createdAt).format('YYYY-MM-DD HH:mm')}</p>
+
+                        {a.blockchainTxHash && (
+                          <div className="mt-2 flex flex-wrap items-center gap-2">
+                            <span className="font-mono text-[11px] text-muted-foreground break-all">
+                              tx: {a.blockchainTxHash}
+                            </span>
+                            <button
+                              onClick={() => handleQueryTx(a._id)}
+                              className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                              title="通过后端代理查询交易详情（避免网关 401）"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                              查看链上交易
+                            </button>
+                          </div>
+                        )}
+
+                        {a.errorMessage && (
+                          <p className="mt-2 rounded-md bg-destructive/10 px-2 py-1 text-xs text-destructive">
+                            {a.errorMessage}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className={`ml-4 flex shrink-0 items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium ${s.color}`}>
+                        {s.icon} {s.label}
+                      </div>
                     </div>
                   </div>
                 );

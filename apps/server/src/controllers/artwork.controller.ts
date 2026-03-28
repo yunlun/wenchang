@@ -1,6 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../middlewares/auth.middleware';
 import { artworkService } from '../services/artwork.service';
+import { wenchangService } from '../services/wenchang.service';
 import { AppError } from '../middlewares/errorHandler';
 
 export const uploadArtwork = async (
@@ -56,6 +57,28 @@ export const getArtwork = async (
     );
     if (!artwork) throw new AppError('作品不存在', 404);
     res.json({ code: 0, data: artwork });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const queryArtworkTx = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const artwork = await artworkService.getArtworkById(
+      String(req.params.id),
+      req.user!.id
+    );
+    if (!artwork) throw new AppError('作品不存在', 404);
+    if (!artwork.blockchainTxHash) throw new AppError('该作品暂无链上交易哈希', 400);
+
+    const result = await wenchangService.queryByTxHash(artwork.blockchainTxHash);
+    if (!result.found) throw new AppError('未查询到该交易，请稍后重试', 404);
+
+    res.json({ code: 0, data: result });
   } catch (error) {
     next(error);
   }

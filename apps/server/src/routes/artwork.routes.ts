@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { uploadArtwork, listArtworks, getArtwork } from '../controllers/artwork.controller';
+import { uploadArtwork, listArtworks, getArtwork, queryArtworkTx } from '../controllers/artwork.controller';
 import { authenticate, checkQuota } from '../middlewares/auth.middleware';
 import { validate } from '../middlewares/validate';
 import { upload } from '../config/multer';
@@ -24,6 +24,9 @@ router.get('/', listArtworks);
 
 /** GET /api/v1/artworks/:id */
 router.get('/:id', getArtwork);
+
+/** GET /api/v1/artworks/:id/tx */
+router.get('/:id/tx', queryArtworkTx);
 
 /** POST /api/v1/artworks  (multipart/form-data) */
 router.post(

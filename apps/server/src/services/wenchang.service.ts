@@ -1,4 +1,8 @@
 import axios, { AxiosInstance } from 'axios';
+import * as https from 'https';
+import * as http from 'http';
+import * as net from 'net';
+import * as tls from 'tls';
 import type {
   WenchangSubmitRequest,
   WenchangSubmitResponse,
@@ -26,6 +30,7 @@ export class WenchangService {
   private bsnAccount: string;
   private chainId: string;
   private fromAddress: string;
+  private makeHttpsAgent: () => https.Agent;
 
   constructor() {
     const baseURL = process.env.WENCHANG_API_URL || 'https://opbningxia.bsngate.com:18602';
@@ -38,6 +43,14 @@ export class WenchangService {
     if (!this.projectId) throw new Error('请在 .env 中配置 BSN_PROJECT_ID');
     if (!this.projectKey) throw new Error('请在 .env 中配置 BSN_PROJECT_KEY');
 
+    const makeHttpsAgent = () => {
+      // 强制直连，忽略系统代理（Cursor 注入的动态代理不适用于 BSN）
+      return new https.Agent({ rejectUnauthorized: false });
+    };
+
+    // httpsAgent 在每次请求时动态创建，确保读到最新的代理配置
+    this.makeHttpsAgent = makeHttpsAgent;
+
     this.client = axios.create({
       baseURL,
       timeout: 30_000,
@@ -45,6 +58,7 @@ export class WenchangService {
         'Content-Type': 'application/json',
         'x-api-key': this.projectKey,
       },
+      proxy: false,
     });
 
     this.client.interceptors.request.use((config) => {
@@ -82,101 +96,99 @@ export class WenchangService {
     const memo = `WC:${payload.hash}|${payload.metadata.title}|${payload.metadata.author}`;
     const from = this.fromAddress;
     const denom = process.env.WENCHANG_FEE_DENOM || 'ugas';
-    const gas = process.env.WENCHANG_GAS || '80000';
-    const feeAmount = process.env.WENCHANG_FEE_AMOUNT || '800';
+    const gas = process.env.WENCHANG_GAS || '200000';
+    const feeAmount = process.env.WENCHANG_FEE_AMOUNT || '200000';
+    const privateKey = process.env.WENCHANG_PRIVATE_KEY || '';
+    const publicKey = process.env.WENCHANG_PUBLIC_KEY || '';
+    // 文昌链 ugas 受 owner 限制，转账目标需为 owner 地址
+    const transferTo = process.env.WENCHANG_TOKEN_OWNER || 'iaa14ffm5gc6g698ckmgp63q49963fra4w5aspmrd9';
 
-    // BSN 托管签名广播报文（v1 格式）
-    const txBody = {
-      tx: {
-        msg: [
-          {
-            type: 'cosmos-sdk/MsgSend',
-            value: {
-              from_address: from,
-              to_address: from,          // 零值自发，只是为了把 memo 写链上
-              amount: [{ amount: '1', denom }],
-            },
-          },
-        ],
-        fee: {
-          amount: [{ amount: feeAmount, denom }],
-          gas,
-        },
-        signatures: null,
-        memo,
-      },
-      mode: 'sync',
-    };
-
-    const paths = this.restPaths('txs');
-    const errors: string[] = [];
-
-    for (const path of paths) {
-      try {
-        logger.debug(`[Wenchang] trying path: ${path}`);
-        const { data } = await this.client.post(path, txBody);
-
-        const raw = (data || {}) as Record<string, unknown>;
-        const txHash =
-          (raw.txhash as string) ||
-          (raw.tx_hash as string) ||
-          (raw.txHash as string) ||
-          (raw.hash as string) ||
-          ((raw.result as { txhash?: string } | undefined)?.txhash) ||
-          '';
-
-        // ── 关键：检查链上 code，非 0 表示交易被链拒绝 ──
-        const chainCode = raw.code as number | undefined;
-        if (chainCode !== undefined && chainCode !== 0) {
-          const rawLog = (raw.raw_log as string) || JSON.stringify(raw);
-          const msg = `交易被链拒绝 code=${chainCode}: ${rawLog}`;
-          logger.error(`[Wenchang] ${path} ${msg}`);
-          errors.push(`[${path}] chain_code=${chainCode} raw_log=${rawLog.slice(0, 200)}`);
-          continue; // 尝试下一条路径（通常无意义，但保持一致性）
-        }
-
-        if (!txHash) {
-          logger.warn(`[Wenchang] ${path} returned 2xx but no txHash: ${JSON.stringify(raw)}`);
-          errors.push(`[${path}] no_txhash: ${JSON.stringify(raw).slice(0, 200)}`);
-          continue;
-        }
-
-        logger.info(`[Wenchang] submitHash success txHash=${txHash}`);
-        return {
-          success: true,
-          txHash,
-          blockHeight:
-            (raw.height as number | undefined) ||
-            (raw.block_height as number | undefined),
-          fee: `${feeAmount}${denom}`,
-          timestamp: new Date().toISOString(),
-        };
-      } catch (error: unknown) {
-        const e = error as { response?: { status?: number; data?: unknown }; message?: string };
-        const status = e.response?.status ?? 0;
-        const body = JSON.stringify(e.response?.data || {}).slice(0, 300);
-        const msg = `[${path}] status=${status} body=${body}`;
-        errors.push(msg);
-        logger.warn(`[Wenchang] ${msg}`);
-
-        if (body.includes('Non-gRPC')) {
-          throw new Error(
-            '当前 BSN 网关端口是 gRPC 路由，无法用 HTTP/JSON 调用。' +
-            '请去 BSN 控制台查看「接入参数」里的 REST 接口地址（通常端口不同）。'
-          );
-        }
-      }
+    if (!privateKey || !publicKey) {
+      throw new Error('请在 .env 中配置 WENCHANG_PRIVATE_KEY 和 WENCHANG_PUBLIC_KEY');
     }
 
-    const detail = errors.join(' \n');
-    logger.error('[Wenchang] submitHash failed all paths:', detail);
-    throw new Error(
-      `文昌链存证提交失败。\n排查步骤：\n` +
-      `1. 确认 WENCHANG_BSN_ACCOUNT 已正确配置（BSN控制台->接入参数）\n` +
-      `2. 确认 WENCHANG_FROM_ADDRESS 已配置（链上账户地址）\n` +
-      `3. 或设置 WENCHANG_SUBMIT_PATH 为精确接口路径\n` +
-      `详细错误：\n${detail}`
-    );
+    const httpsAgent = this.makeHttpsAgent();
+    logger.info(`[Wenchang] submitHash (secp256k1) from=${from} to=${transferTo} url=${process.env.WENCHANG_API_URL} pub=${publicKey.slice(0, 10)}...`);
+
+    // ── Step 1: 查询账户信息 ──
+    const accountPath = `/api/${this.projectId}/rest/cosmos/auth/v1beta1/accounts/${from}`;
+    let accountNumber = '0';
+    let sequence = '0';
+    try {
+      const { data } = await this.client.get(accountPath, { httpsAgent });
+      const acc = (data?.account?.value || data?.account || data?.result?.value || data?.result || data) as any;
+      accountNumber = String(acc?.account_number ?? acc?.accountNumber ?? '0');
+      sequence = String(acc?.sequence ?? '0');
+      logger.info(`[Wenchang] account_number=${accountNumber} sequence=${sequence}`);
+    } catch (e: any) {
+      logger.warn(`[Wenchang] Failed to query account: ${e.message}`);
+    }
+
+    // ── Step 2: 构建并签名交易 ──
+    const { buildSignedTx } = await import('./sm2-signer');
+    const { txBytesBase64 } = await buildSignedTx({
+      privateKey,
+      publicKey,
+      fromAddress: from,
+      toAddress: transferTo,
+      amount: '1',
+      denom,
+      fee: feeAmount,
+      feeDenom: denom,
+      gas,
+      memo,
+      chainId: this.chainId,
+      accountNumber,
+      sequence,
+    });
+
+    // ── Step 3: RPC 广播 ──
+    const broadcastPath = `/api/${this.projectId}/rpc`;
+    const rpcBody = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'broadcast_tx_sync',
+      params: { tx: txBytesBase64 },
+    };
+    const errors: string[] = [];
+
+    try {
+      logger.debug(`[Wenchang] broadcasting to: ${broadcastPath}`);
+      const { data } = await this.client.post(broadcastPath, rpcBody, { httpsAgent });
+
+      const raw = (data || {}) as Record<string, unknown>;
+      const result = (raw.result || {}) as Record<string, unknown>;
+      const txHash = (result.hash as string) || (raw.txhash as string) || '';
+      const code = result.code as number | undefined;
+
+      if (code !== undefined && code !== 0) {
+        const log = (result.log as string) || JSON.stringify(result);
+        throw new Error(`交易被链拒绝 code=${code}: ${log.slice(0, 300)}`);
+      }
+
+      if (!txHash) {
+        throw new Error(`广播成功但未返回 txHash: ${JSON.stringify(raw).slice(0, 200)}`);
+      }
+
+      logger.info(`[Wenchang] submitHash success txHash=${txHash}`);
+      return {
+        success: true,
+        txHash,
+        fee: `${feeAmount}${denom}`,
+        timestamp: new Date().toISOString(),
+      };
+    } catch (error: unknown) {
+      const e = error as { response?: { status?: number; data?: unknown }; message?: string; code?: string };
+      const status = e.response?.status ?? 0;
+      const body = JSON.stringify(e.response?.data || {}).slice(0, 300);
+      const msg = `[${broadcastPath}] status=${status} body=${body} message=${e.message}`;
+      errors.push(msg);
+      logger.warn(`[Wenchang] ${msg}`);
+    }
+
+    const detail = errors.join('\n');
+    logger.error('[Wenchang] submitHash failed:', detail);
+    throw new Error(`文昌链存证提交失败。\n详细错误：\n${detail}`);
   }
 
   /**

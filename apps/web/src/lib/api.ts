@@ -55,6 +55,7 @@ export const artworkApi = {
   list: (page = 1, pageSize = 20) =>
     apiClient.get('/artworks', { params: { page, pageSize } }),
   get: (id: string) => apiClient.get(`/artworks/${id}`),
+  queryTx: (id: string) => apiClient.get(`/artworks/${id}/tx`),
   upload: (formData: FormData) =>
     apiClient.post('/artworks', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },

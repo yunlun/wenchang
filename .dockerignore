@@ -1,0 +1,31 @@
+# dependencies
+node_modules
+**/node_modules
+
+# build outputs
+**/dist
+**/.next
+**/out
+
+# env files (inject via Zeabur env vars)
+**/.env
+**/.env.local
+**/.env*.local
+
+# dev / test
+**/.turbo
+**/*.log
+**/coverage
+**/__tests__
+
+# OS / editor
+.DS_Store
+.git
+.gitignore
+.vscode
+.idea
+
+# docker
+Dockerfile
+.dockerignore
+docker-compose.yml
